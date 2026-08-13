@@ -3,11 +3,17 @@ import pandas as pd
 import mplfinance as mpf
 import matplotlib.pyplot as plt
 import numpy as np
-import os  # <-- اضافه شده برای باز کردن فایل
+import os
+import subprocess
+import time  # for a tiny delay
 
-# خواندن فایل JSON
-file_path = input ('Json File Please : ')
+# 1. Read JSON file path
+file_path = input('Json File Please : ').strip()
+if not file_path:
+    print("No file specified. Exiting.")
+    exit()
 
+# 2. Load data
 with open(file_path, 'r') as f:
     data = json.load(f)
 
@@ -25,7 +31,7 @@ df.rename(columns={
 
 df.sort_index(inplace=True)
 
-# رسم نمودار با قابلیت بازگشت figure و axes
+# 3. Plot
 fig, axes = mpf.plot(
     df,
     type='candle',
@@ -40,15 +46,14 @@ fig, axes = mpf.plot(
     returnfig=True
 )
 
-# دریافت محورهای اصلی و پایین
 ax_main = axes[0]
 ax_vol = axes[1]
 
-# annotation برای نمایش اطلاعات
+# 4. Hover annotation
 annotation = ax_main.annotate(
-    '', 
-    xy=(0, 0), 
-    xytext=(10, 10), 
+    '',
+    xy=(0, 0),
+    xytext=(10, 10),
     textcoords='offset points',
     bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7),
     fontsize=9,
@@ -81,22 +86,36 @@ def on_motion(event):
 
 fig.canvas.mpl_connect('motion_notify_event', on_motion)
 
-# ذخیره تصویر به‌صورت PNG با کیفیت بالا
-output_filename = 'candle_chart.png'
-fig.savefig(output_filename, dpi=300, bbox_inches='tight')
+# 5. Save figure with absolute path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+output_filename = os.path.join(script_dir, 'candle_chart.png')
 
-# --- باز کردن فایل PNG با برنامه پیش‌فرض سیستم ---
-if os.name == 'nt':  # ویندوز
-    os.startfile(output_filename)
-elif os.name == 'posix':  # لینوکس / مک
-    # برای لینوکس (با xdg-open) و مک (با open)
-    import subprocess
-    try:
-        subprocess.Popen(['xdg-open', output_filename])  # لینوکس
-    except:
-        subprocess.Popen(['open', output_filename])      # مک
+print(f"Attempting to save chart to: {output_filename}")
+try:
+    fig.savefig(output_filename, dpi=300, bbox_inches='tight')
+    time.sleep(0.1)  # give the OS a moment to finish writing
+    print("Save completed.")
+except Exception as e:
+    print(f"Error saving chart: {e}")
+    exit()
+
+# 6. Verify the file exists before opening
+if os.path.isfile(output_filename):
+    print(f"File exists at: {output_filename}")
+    # Open with default program
+    if os.name == 'nt':  # Windows
+        # Use 'start' via subprocess – handles spaces and special characters
+        subprocess.Popen(['start', output_filename], shell=True)
+    elif os.name == 'posix':  # Linux / macOS
+        try:
+            subprocess.Popen(['xdg-open', output_filename])
+        except:
+            subprocess.Popen(['open', output_filename])
+    else:
+        print(f"File saved, but can't auto-open on this OS: {output_filename}")
 else:
-    print(f"فایل ذخیره شد: {output_filename} (سیستمعامل پشتیبانی نمی‌شود برای باز کردن خودکار)")
+    print(f"ERROR: File was NOT saved at {output_filename}")
+    print("Please check permissions or disk space.")
 
-# نمایش پنجره تعاملی (با قابلیت حرکت موس)
+# 7. Show interactive window
 plt.show()
