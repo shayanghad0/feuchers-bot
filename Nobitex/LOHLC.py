@@ -11,7 +11,7 @@ from rich import box
 # --- Configuration ---
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 TIMEOUT = 10
-SYMBOL = "BTCUSDT"   # fixed as requested
+SYMBOL = "BTCIRT"   # fixed as requested
 
 # Map user-friendly intervals to Nobitex resolution codes
 INTERVAL_MAP = {
@@ -40,7 +40,7 @@ console = Console()
 def get_current_price():
     """Fetch latest price from Nobitex stats."""
     url = "https://apiv2.nobitex.ir/market/stats"
-    params = {"srcCurrency": "btc", "dstCurrency": "usdt"}
+    params = {"srcCurrency": "btc", "dstCurrency": "IRT"}
     headers = {"User-Agent": USER_AGENT}
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
@@ -49,17 +49,17 @@ def get_current_price():
         if data.get('status') != 'ok':
             raise Exception("Stats API error")
         stats = data['stats']
-        # The key is like "btc-usdt" but may be lowercase? The API returns "btc-usdt"?
+        # The key is like "btc-IRT" but may be lowercase? The API returns "btc-IRT"?
         # Actually the example shows "btc-rls", so we'll construct it.
         key = f"{params['srcCurrency']}-{params['dstCurrency']}"
         if key not in stats:
-            # Try alternative: "BTCUSDT" maybe? Let's search for any key containing 'btc' and 'usdt'
+            # Try alternative: "BTCIRT" maybe? Let's search for any key containing 'btc' and 'IRT'
             for k in stats:
-                if 'btc' in k and 'usdt' in k:
+                if 'btc' in k and 'IRT' in k:
                     key = k
                     break
             else:
-                raise Exception("No BTCUSDT stats found")
+                raise Exception("No BTCIRT stats found")
         return float(stats[key]['latest'])
     except Exception as e:
         console.print(f"[red]Error fetching price: {e}[/red]")
@@ -211,7 +211,7 @@ def build_layout(candles, current_idx, interval_sec):
         label = f"{int(total//3600)}h"
     else:
         label = f"{int(total//86400)}d"
-    header_text = f"BTC/USDT [{label}] - last {len(candles)} candles"
+    header_text = f"BTC/IRT [{label}] - last {len(candles)} candles"
     countdown_text = f"Next candle in: {int(remaining)}s [{bar}] {percent:.0f}%"
 
     chart_rows = render_candlestick_chart(candles, current_idx)
@@ -251,7 +251,7 @@ def build_layout(candles, current_idx, interval_sec):
 
 
 def main():
-    console.print("[bold green]Live OHLC for BTC/USDT from Nobitex[/bold green]")
+    console.print("[bold green]Live OHLC for BTC/IRT from Nobitex[/bold green]")
     interval_input = input("Enter timeframe (e.g., 1m, 5m, 1h) [default: 1m]: ").strip() or '1m'
     if interval_input not in INTERVAL_MAP:
         console.print(f"[red]Unsupported. Using 1m. Supported: {', '.join(INTERVAL_MAP.keys())}[/red]")
