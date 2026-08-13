@@ -258,8 +258,10 @@ def create_trade(signal_record, entry_price, side, interval_label, signal_candle
         'sl_price': sl_price,
         'half_tp_price': half_tp_price,
         'half_tp_hit': False,
+        'half_tp_revisited': False,
+        'entry_revisited_after_half_tp': False,
         'full_tp_hit': False,
-        'status': 'open',          # 'open', 'tp', 'sl'
+        'status': 'open',          # 'open', 'tp', 'sl', 'break_even', 'half_revisited'
         'close_time': None,
         'close_price': None,
         'pnl_percent': None,
@@ -275,6 +277,8 @@ def check_trade_hit(trade, candle, current_price=None):
       - 'tp' if full TP hit
       - 'sl' if SL hit
       - 'half' if half-TP hit (and not already hit)
+      - 'half_revisited' if price revisits half_tp after initial hit
+      - 'break_even' if price returns to entry after hitting half_tp
       - None if nothing new
     """
     high = candle['high']
@@ -283,7 +287,32 @@ def check_trade_hit(trade, candle, current_price=None):
     result = None
 
     if side == 'long':
-        if high >= trade['tp_price'] and not trade['full_tp_hit']:
+        # Check if half_tp was hit and price revisits it (failed breakout)
+        if (
+            trade['half_tp_hit'] and not trade['half_tp_revisited'] and
+            high >= trade['half_tp_price']
+        ):
+            trade['half_tp_revisited'] = True
+            trade['status'] = 'half_revisited'
+            trade['close_price'] = trade['half_tp_price']
+            trade['close_time'] = datetime.now(timezone.utc).isoformat()
+            trade['pnl_percent'] = HALF_TP_PERCENT
+            result = 'half_revisited'
+
+        # Check if price returns to entry after hitting half_tp (break-even protection)
+        elif (
+            trade['half_tp_hit'] and not trade['entry_revisited_after_half_tp'] and
+            low <= trade['entry_price']
+        ):
+            trade['entry_revisited_after_half_tp'] = True
+            trade['status'] = 'break_even'
+            trade['close_price'] = trade['entry_price']
+            trade['close_time'] = datetime.now(timezone.utc).isoformat()
+            trade['pnl_percent'] = 0.0
+            result = 'break_even'
+
+        # Existing logic for full TP, half TP, and SL
+        elif high >= trade['tp_price'] and not trade['full_tp_hit']:
             trade['full_tp_hit'] = True
             trade['status'] = 'tp'
             trade['close_price'] = trade['tp_price']
@@ -300,7 +329,32 @@ def check_trade_hit(trade, candle, current_price=None):
             trade['pnl_percent'] = -SL_PERCENT
             result = 'sl'
     else:  # short
-        if low <= trade['tp_price'] and not trade['full_tp_hit']:
+        # Check if half_tp was hit and price revisits it (failed breakout)
+        if (
+            trade['half_tp_hit'] and not trade['half_tp_revisited'] and
+            low <= trade['half_tp_price']
+        ):
+            trade['half_tp_revisited'] = True
+            trade['status'] = 'half_revisited'
+            trade['close_price'] = trade['half_tp_price']
+            trade['close_time'] = datetime.now(timezone.utc).isoformat()
+            trade['pnl_percent'] = HALF_TP_PERCENT
+            result = 'half_revisited'
+
+        # Check if price returns to entry after hitting half_tp (break-even protection)
+        elif (
+            trade['half_tp_hit'] and not trade['entry_revisited_after_half_tp'] and
+            high >= trade['entry_price']
+        ):
+            trade['entry_revisited_after_half_tp'] = True
+            trade['status'] = 'break_even'
+            trade['close_price'] = trade['entry_price']
+            trade['close_time'] = datetime.now(timezone.utc).isoformat()
+            trade['pnl_percent'] = 0.0
+            result = 'break_even'
+
+        # Existing logic for full TP, half TP, and SL
+        elif low <= trade['tp_price'] and not trade['full_tp_hit']:
             trade['full_tp_hit'] = True
             trade['status'] = 'tp'
             trade['close_price'] = trade['tp_price']
@@ -361,7 +415,9 @@ def export_trade_png(trade, candles, event_type):
     event_label = {
         'half': 'Half TP Hit',
         'tp': 'Full TP Hit',
-        'sl': 'Stop Loss Hit'
+        'sl': 'Stop Loss Hit',
+        'half_revisited': 'Half TP Revisited (Failed Breakout)',
+        'break_even': 'Break-Even (Price Returned to Entry)',
     }[event_type]
     last_idx = len(plot_candles) - 1
     last_candle = plot_candles[-1]
@@ -674,7 +730,7 @@ def build_layout(candles, current_idx, interval_sec, last_signal_text, active_tr
         trade_info = f"Side: {side} | Entry: {entry:.2f} | TP: {tp:.2f} | SL: {sl:.2f} | Half: {half:.2f} | PnL: [{color_pnl}]{pnl_str}[/{color_pnl}]"
         if active_trade['half_tp_hit']:
             trade_info += " [yellow]Half TP hit![/yellow]"
-    elif active_trade and active_trade['status'] in ('tp', 'sl'):
+    elif active_trade and active_trade['status'] in ('tp', 'sl', 'half_revisited', 'break_even'):
         side = active_trade['side'].upper()
         entry = active_trade['entry_price']
         status = active_trade['status'].upper()
@@ -682,7 +738,7 @@ def build_layout(candles, current_idx, interval_sec, last_signal_text, active_tr
         pnl_str = f"{pnl:+.2f}%"
         color_pnl = "green" if pnl >= 0 else "red"
         trade_info = f"Trade closed: {side} | Entry: {entry:.2f} | Status: {status} | PnL: [{color_pnl}]{pnl_str}[/{color_pnl}]"
-    trade_panel = Panel(trade_info, title="Trade Status", border_style=TV_PRICE_LINE if active_trade else TV_GRID, box=box.SQUARE)
+    trade_panel = Panel(trade_info, title="Trade Status", border_style=TV_PRICE_LINE if active_trade and active_trade['status'] == 'open' else TV_GRID, box=box.SQUARE)
 
     signal_panel = Panel(
         last_signal_text or "No engulfing signal yet.",
@@ -825,6 +881,14 @@ def main():
                     elif result == 'sl':
                         png_path = export_trade_png(active_trade, candles, 'sl')
                         console.print(f"[bold red]Stop Loss hit! Trade closed. PNG: {png_path}[/bold red]")
+                        update_trade_log(active_trade)
+                    elif result == 'half_revisited':
+                        png_path = export_trade_png(active_trade, candles, 'half_revisited')
+                        console.print(f"[bold yellow]Half TP revisited! Trade closed at TP1 (Failed Breakout). PNG: {png_path}[/bold yellow]")
+                        update_trade_log(active_trade)
+                    elif result == 'break_even':
+                        png_path = export_trade_png(active_trade, candles, 'break_even')
+                        console.print(f"[bold yellow]Price returned to entry after half TP! Trade closed at break-even. PNG: {png_path}[/bold yellow]")
                         update_trade_log(active_trade)
 
                 layout = build_layout(candles, current_idx, interval_sec, last_signal_text, active_trade, console_height)

@@ -20,8 +20,8 @@ TIMEOUT = 15
 RETRY_ATTEMPTS = 3
 BACKOFF_FACTOR = 1.5
 
-TP_PERCENT = 1.0
-SL_PERCENT = 0.5
+TP_PERCENT = 0.5
+SL_PERCENT = 0.25
 HALF_TP_PERCENT = TP_PERCENT / 2
 
 INTERVAL_MAP = {
@@ -307,8 +307,10 @@ def create_trade(signal_record, entry_price, side, interval_label, signal_candle
         'sl_price': sl_price,
         'half_tp_price': half_tp_price,
         'half_tp_hit': False,
+        'half_tp_revisited': False,
+        'entry_revisited_after_half_tp': False,
         'full_tp_hit': False,
-        'status': 'open',
+        'status': 'open',          # 'open', 'tp', 'sl', 'break_even', 'half_revisited'
         'close_time': None,
         'close_price': None,
         'pnl_percent': None,
@@ -321,13 +323,48 @@ def create_trade(signal_record, entry_price, side, interval_label, signal_candle
     return trade
 
 def check_trade_hit(trade, candle):
+    """
+    Check if the given candle (OHLC) has touched TP/SL/half-TP.
+    Updates trade flags and returns:
+      - 'tp' if full TP hit
+      - 'sl' if SL hit
+      - 'half' if half-TP hit (and not already hit)
+      - 'half_revisited' if price revisits half_tp after initial hit
+      - 'break_even' if price returns to entry after hitting half_tp
+      - None if nothing new
+    """
     high = candle['high']
     low = candle['low']
     side = trade['side']
     result = None
 
     if side == 'long':
-        if high >= trade['tp_price'] and not trade['full_tp_hit']:
+        # Check if half_tp was hit and price revisits it (failed breakout)
+        if (
+            trade['half_tp_hit'] and not trade['half_tp_revisited'] and
+            high >= trade['half_tp_price']
+        ):
+            trade['half_tp_revisited'] = True
+            trade['status'] = 'half_revisited'
+            trade['close_price'] = trade['half_tp_price']
+            trade['close_time'] = candle['start_time'].isoformat()
+            trade['pnl_percent'] = HALF_TP_PERCENT
+            result = 'half_revisited'
+
+        # Check if price returns to entry after hitting half_tp (break-even protection)
+        elif (
+            trade['half_tp_hit'] and not trade['entry_revisited_after_half_tp'] and
+            low <= trade['entry_price']
+        ):
+            trade['entry_revisited_after_half_tp'] = True
+            trade['status'] = 'break_even'
+            trade['close_price'] = trade['entry_price']
+            trade['close_time'] = candle['start_time'].isoformat()
+            trade['pnl_percent'] = 0.0
+            result = 'break_even'
+
+        # Existing logic for full TP, half TP, and SL
+        elif high >= trade['tp_price'] and not trade['full_tp_hit']:
             trade['full_tp_hit'] = True
             trade['status'] = 'tp'
             trade['close_price'] = trade['tp_price']
@@ -343,8 +380,33 @@ def check_trade_hit(trade, candle):
             trade['close_time'] = candle['start_time'].isoformat()
             trade['pnl_percent'] = -SL_PERCENT
             result = 'sl'
-    else:
-        if low <= trade['tp_price'] and not trade['full_tp_hit']:
+    else:  # short
+        # Check if half_tp was hit and price revisits it (failed breakout)
+        if (
+            trade['half_tp_hit'] and not trade['half_tp_revisited'] and
+            low <= trade['half_tp_price']
+        ):
+            trade['half_tp_revisited'] = True
+            trade['status'] = 'half_revisited'
+            trade['close_price'] = trade['half_tp_price']
+            trade['close_time'] = candle['start_time'].isoformat()
+            trade['pnl_percent'] = HALF_TP_PERCENT
+            result = 'half_revisited'
+
+        # Check if price returns to entry after hitting half_tp (break-even protection)
+        elif (
+            trade['half_tp_hit'] and not trade['entry_revisited_after_half_tp'] and
+            high >= trade['entry_price']
+        ):
+            trade['entry_revisited_after_half_tp'] = True
+            trade['status'] = 'break_even'
+            trade['close_price'] = trade['entry_price']
+            trade['close_time'] = candle['start_time'].isoformat()
+            trade['pnl_percent'] = 0.0
+            result = 'break_even'
+
+        # Existing logic for full TP, half TP, and SL
+        elif low <= trade['tp_price'] and not trade['full_tp_hit']:
             trade['full_tp_hit'] = True
             trade['status'] = 'tp'
             trade['close_price'] = trade['tp_price']
@@ -444,6 +506,8 @@ def generate_html_report(summary, trades, equity_curve, output_path):
     avg_pnl_pct = summary.get('avg_pnl_pct', 0)
     avg_pnl_dollar = summary.get('avg_pnl_dollar', 0)
     half_hits = summary.get('half_hits', 0)
+    half_revisited_hits = summary.get('half_revisited_hits', 0)
+    break_even_hits = summary.get('break_even_hits', 0)
     initial_capital = summary.get('initial_capital', 0)
     final_capital = summary.get('final_capital', 0)
     html = f"""
@@ -476,6 +540,8 @@ def generate_html_report(summary, trades, equity_curve, output_path):
             <div class="stat"><span class="stat-label">Win Rate</span><span class="stat-value">{win_rate:.2f}%</span></div>
             <div class="stat"><span class="stat-label">Avg PnL</span><span class="stat-value">{avg_pnl_pct:+.2f}% (${avg_pnl_dollar:+.2f})</span></div>
             <div class="stat"><span class="stat-label">Half-TP Hits</span><span class="stat-value">{half_hits}</span></div>
+            <div class="stat"><span class="stat-label">Half-TP Revisited Hits</span><span class="stat-value">{half_revisited_hits}</span></div>
+            <div class="stat"><span class="stat-label">Break-Even Hits</span><span class="stat-value">{break_even_hits}</span></div>
         </div>
         <h2>Equity Curve</h2>
         <div class="chart">
@@ -536,10 +602,10 @@ def run_backtest(interval_label, num_candles, initial_capital, leverage, positio
 
         if active_trade is not None and active_trade['status'] == 'open':
             result = check_trade_hit(active_trade, curr_candle)
-            if result in ('half', 'tp', 'sl'):
+            if result in ('half', 'tp', 'sl', 'half_revisited', 'break_even'):
                 if result == 'half':
                     pass
-                elif result in ('tp', 'sl'):
+                elif result in ('tp', 'sl', 'half_revisited', 'break_even'):
                     pnl_percent = active_trade['pnl_percent']
                     notional = capital * position_fraction * leverage
                     dollar_pnl = notional * (pnl_percent / 100.0)
@@ -622,13 +688,17 @@ def run_backtest(interval_label, num_candles, initial_capital, leverage, positio
         avg_pnl_pct = sum(t['pnl_percent'] for t in trades) / len(trades)
         avg_pnl_dollar = sum(t.get('pnl_dollar', 0) for t in trades) / len(trades)
         half_hits = sum(1 for t in trades if t.get('half_tp_hit', False))
+        half_revisited_hits = sum(1 for t in trades if t.get('status') == 'half_revisited')
+        break_even_hits = sum(1 for t in trades if t.get('status') == 'break_even')
         summary.update({
             'wins': wins,
             'losses': losses,
             'win_rate': win_rate,
             'avg_pnl_pct': avg_pnl_pct,
             'avg_pnl_dollar': avg_pnl_dollar,
-            'half_hits': half_hits
+            'half_hits': half_hits,
+            'half_revisited_hits': half_revisited_hits,
+            'break_even_hits': break_even_hits
         })
         console.print(f"Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.2f}%")
         console.print(f"Initial capital: ${initial_capital:.2f}")
@@ -637,6 +707,8 @@ def run_backtest(interval_label, num_candles, initial_capital, leverage, positio
         console.print(f"Average trade PnL (without leverage): {avg_pnl_pct:+.2f}%")
         console.print(f"Average trade PnL (with leverage & sizing): ${avg_pnl_dollar:+.2f}")
         console.print(f"Half-TP hits: {half_hits}")
+        console.print(f"Half-TP revisited hits: {half_revisited_hits}")
+        console.print(f"Break-even hits: {break_even_hits}")
     else:
         console.print("No trades executed.")
         summary['wins'] = 0
@@ -645,6 +717,8 @@ def run_backtest(interval_label, num_candles, initial_capital, leverage, positio
         summary['avg_pnl_pct'] = 0
         summary['avg_pnl_dollar'] = 0
         summary['half_hits'] = 0
+        summary['half_revisited_hits'] = 0
+        summary['break_even_hits'] = 0
 
     # Export PNG and HTML
     if len(equity_curve) > 1:
