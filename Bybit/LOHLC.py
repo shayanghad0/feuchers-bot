@@ -7,10 +7,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
 from rich import box
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- Configuration ---
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-TIMEOUT = 10
+TIMEOUT = 15
+RETRY_ATTEMPTS = 3
+BACKOFF_FACTOR = 1.5
 
 INTERVAL_MAP = {
     '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
@@ -27,12 +31,28 @@ CHART_HEIGHT = 15
 
 console = Console()
 
+# Create a session with retry strategy
+def create_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=RETRY_ATTEMPTS,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+session = create_session()
+
 def get_current_price():
     url = "https://api.bybit.com/v5/market/tickers"
     params = {"category": "spot", "symbol": "BTCUSDT"}
-    headers = {"User-Agent": USER_AGENT}
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+        resp = session.get(url, params=params, timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         return float(data['result']['list'][0]['lastPrice'])
@@ -43,9 +63,8 @@ def get_current_price():
 def fetch_completed_candles(interval_code, limit):
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "spot", "symbol": "BTCUSDT", "interval": interval_code, "limit": limit}
-    headers = {"User-Agent": USER_AGENT}
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+        resp = session.get(url, params=params, timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         if data['retCode'] != 0:
@@ -89,29 +108,22 @@ def render_candlestick_chart(candles, current_idx, height=CHART_HEIGHT):
     if not candles:
         return ["No data"]
 
-    # ---- Improved scaling ----
-    # Get raw min/max from all candles
-    min_price = min(c['low'] for c in candles)
-    max_price = max(c['high'] for c in candles)
-    avg_price = (min_price + max_price) / 2.0
-    raw_range = max_price - min_price
-    # If range is too wide (>5% of average), cap it to ±2.5% for better readability
-    if raw_range / avg_price > 0.05:
-        # Use a zoomed range around the average
-        zoom_range = avg_price * 0.05  # 5% total (2.5% each side)
-        min_price = avg_price - zoom_range / 2
-        max_price = avg_price + zoom_range / 2
+    # Auto‑zoom with margin
+    raw_min = min(c['low'] for c in candles)
+    raw_max = max(c['high'] for c in candles)
+    avg = (raw_min + raw_max) / 2.0
+    if (raw_max - raw_min) / avg > 0.05:
+        half_range = avg * 0.025
+        min_price = avg - half_range
+        max_price = avg + half_range
     else:
-        # Add a small margin (2% of range) to avoid edge clipping
-        margin = raw_range * 0.02
-        min_price -= margin
-        max_price += margin
+        margin = (raw_max - raw_min) * 0.02
+        min_price = raw_min - margin
+        max_price = raw_max + margin
 
     range_price = max_price - min_price
     if range_price == 0:
         range_price = 1
-
-    price_per_row = range_price / height
 
     # Pre‑compute candle properties
     candle_data = []
@@ -129,9 +141,10 @@ def render_candlestick_chart(candles, current_idx, height=CHART_HEIGHT):
             'color': color
         })
 
+    # Build rows
     rows_chars = []
     for row in range(height):
-        price_level = max_price - row * price_per_row
+        price_level = max_price - row * (range_price / height)
         row_chars = []
         for cd in candle_data:
             if cd['low'] <= price_level <= cd['high']:
@@ -143,7 +156,8 @@ def render_candlestick_chart(candles, current_idx, height=CHART_HEIGHT):
                 row_chars.append((" ", "white"))
         rows_chars.append(row_chars)
 
-    colored_rows = []
+    # Convert to coloured strings with spacing
+    chart_lines = []
     for row_chars in rows_chars:
         parts = []
         for ch, color in row_chars:
@@ -151,8 +165,35 @@ def render_candlestick_chart(candles, current_idx, height=CHART_HEIGHT):
                 parts.append(" ")
             else:
                 parts.append(f"[{color}]{ch}[/{color}]")
-        colored_rows.append(" ".join(parts))
-    return colored_rows
+        chart_lines.append(" ".join(parts))
+
+    # Add price labels on the right
+    max_label_len = max(len(f"{max_price:.2f}"), len(f"{min_price:.2f}")) + 1
+    label_positions = [0, height // 2, height - 1]
+    label_values = [max_price, (max_price + min_price) / 2, min_price]
+
+    for idx, line in enumerate(chart_lines):
+        label = ""
+        if idx in label_positions:
+            pos = label_positions.index(idx)
+            val = label_values[pos]
+            label = f"{val:.2f}"
+        formatted_label = f"{label:>{max_label_len}}" if label else " " * max_label_len
+        chart_lines[idx] = f"{line}  {formatted_label}"
+
+    # Add marker arrow below chart (as an extra row)
+    marker_line = []
+    for i in range(len(candles)):
+        if i == current_idx:
+            marker_line.append("[yellow]▼[/yellow]")
+        else:
+            marker_line.append(" ")
+    marker_str = " ".join(marker_line)
+    # Pad to align with candle width (without labels)
+    # We'll just append it as a new row
+    chart_lines.append(marker_str)
+
+    return chart_lines
 
 def build_layout(candles, current_idx, interval_sec):
     now = datetime.now(timezone.utc)
@@ -176,11 +217,11 @@ def build_layout(candles, current_idx, interval_sec):
         box=box.ROUNDED
     )
 
-    # Table: only the current candle
+    # Table: only current candle
     c = candles[current_idx]
     color = "green" if c['close'] >= c['open'] else "red"
     table = Table(box=box.MINIMAL, show_header=True, header_style="bold")
-    table.add_column("", style="dim")        # marker
+    table.add_column("", style="dim")
     table.add_column("Open", justify="right")
     table.add_column("High", justify="right")
     table.add_column("Low", justify="right")
@@ -212,12 +253,27 @@ def main():
     interval_api = INTERVAL_MAP[interval_input]
     interval_sec = INTERVAL_SECONDS[interval_input]
 
-    completed = fetch_completed_candles(interval_api, KEEP_COUNT)
+    # Retry initial fetch a few times
+    completed = None
+    for attempt in range(3):
+        console.print(f"Fetching initial data... attempt {attempt+1}/3")
+        completed = fetch_completed_candles(interval_api, KEEP_COUNT)
+        if completed is not None:
+            break
+        time.sleep(2)
     if completed is None:
+        console.print("[red]Failed to fetch initial data after multiple attempts. Exiting.[/red]")
         return
 
-    current_price = get_current_price()
+    # Get current price with retry
+    current_price = None
+    for attempt in range(3):
+        current_price = get_current_price()
+        if current_price is not None:
+            break
+        time.sleep(2)
     if current_price is None:
+        console.print("[red]Failed to fetch current price. Exiting.[/red]")
         return
 
     last = completed[-1]
