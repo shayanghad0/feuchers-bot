@@ -1,0 +1,702 @@
+import requests
+import time
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.live import Live
+from rich import box
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+import matplotlib
+matplotlib.use("Agg")  # no display needed, we only export PNG files
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+# --- Configuration ---
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+TIMEOUT = 15
+RETRY_ATTEMPTS = 3
+BACKOFF_FACTOR = 1.5
+
+INTERVAL_MAP = {
+    '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+    '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
+    '1d': 'D', '1w': 'W', '1M': 'M'
+}
+INTERVAL_SECONDS = {
+    '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+    '1h': 3600, '2h': 7200, '4h': 14400, '6h': 21600, '12h': 43200,
+    '1d': 86400, '1w': 604800, '1M': 2592000
+}
+KEEP_COUNT = 30
+CHART_HEIGHT = 15
+
+# Where signals get exported
+OUTPUT_DIR = "signals_output"
+JSON_LOG_PATH = os.path.join(OUTPUT_DIR, "engulfing_signals.json")
+
+console = Console()
+
+
+# ------------------------------------------------------------------
+# HTTP session
+# ------------------------------------------------------------------
+def create_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=RETRY_ATTEMPTS,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+
+session = create_session()
+
+# Bybit blocks requests from US / Mainland-China IPs at the network edge
+# (documented behaviour, not a rate limit) — they come back as an
+# immediate 403 on every attempt. We try Bybit's two mainnet domains
+# first, then fall back to Binance's public API, which uses the same
+# interval strings ('1m', '5m', '1h', ...) so the swap is clean.
+BYBIT_HOSTS = ["https://api.bybit.com", "https://api.bytick.com"]
+BINANCE_HOST = "https://api.binance.com"
+
+# Remembers which source is working so we don't ping-pong between
+# APIs once one of them has proven reachable.
+ACTIVE_SOURCE = {"name": None}  # 'bybit' or 'binance'
+
+
+def _fetch_bybit_price():
+    for host in BYBIT_HOSTS:
+        try:
+            resp = session.get(
+                f"{host}/v5/market/tickers",
+                params={"category": "spot", "symbol": "BTCUSDT"},
+                timeout=TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data['result']['list'][0]['lastPrice'])
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_binance_price():
+    try:
+        resp = session.get(
+            f"{BINANCE_HOST}/api/v3/ticker/price",
+            params={"symbol": "BTCUSDT"},
+            timeout=TIMEOUT
+        )
+        resp.raise_for_status()
+        return float(resp.json()['price'])
+    except Exception as e:
+        console.print(f"[red]Error fetching price from Binance: {e}[/red]")
+        return None
+
+
+def get_current_price():
+    # Stick with whichever source already proved reachable this run.
+    if ACTIVE_SOURCE["name"] == "binance":
+        return _fetch_binance_price()
+    if ACTIVE_SOURCE["name"] == "bybit":
+        price = _fetch_bybit_price()
+        if price is not None:
+            return price
+        # Bybit stopped responding mid-run — fail over to Binance.
+        console.print("[yellow]Bybit stopped responding, switching to Binance...[/yellow]")
+        ACTIVE_SOURCE["name"] = "binance"
+        return _fetch_binance_price()
+
+    # No source picked yet: try Bybit first, then Binance.
+    price = _fetch_bybit_price()
+    if price is not None:
+        ACTIVE_SOURCE["name"] = "bybit"
+        return price
+    console.print("[yellow]Bybit unreachable (likely region-blocked — Bybit blocks US/China IPs). "
+                  "Falling back to Binance...[/yellow]")
+    price = _fetch_binance_price()
+    if price is not None:
+        ACTIVE_SOURCE["name"] = "binance"
+    return price
+
+
+def _fetch_bybit_candles(interval_code, limit):
+    for host in BYBIT_HOSTS:
+        try:
+            resp = session.get(
+                f"{host}/v5/market/kline",
+                params={"category": "spot", "symbol": "BTCUSDT", "interval": interval_code, "limit": limit},
+                timeout=TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data['retCode'] != 0:
+                raise Exception(f"API error: {data['retMsg']}")
+            raw = data['result']['list'][::-1]
+            candles = []
+            for c in raw:
+                ts = int(c[0]) / 1000.0
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                candles.append({
+                    'start_time': dt,
+                    'open': float(c[1]),
+                    'high': float(c[2]),
+                    'low': float(c[3]),
+                    'close': float(c[4]),
+                    'volume': float(c[5])
+                })
+            return candles
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_binance_candles(interval_label, limit):
+    try:
+        resp = session.get(
+            f"{BINANCE_HOST}/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": interval_label, "limit": limit},
+            timeout=TIMEOUT
+        )
+        resp.raise_for_status()
+        raw = resp.json()  # Binance returns oldest-first already
+        candles = []
+        for c in raw:
+            dt = datetime.fromtimestamp(c[0] / 1000.0, tz=timezone.utc)
+            candles.append({
+                'start_time': dt,
+                'open': float(c[1]),
+                'high': float(c[2]),
+                'low': float(c[3]),
+                'close': float(c[4]),
+                'volume': float(c[5])
+            })
+        return candles
+    except Exception as e:
+        console.print(f"[red]Error fetching candles from Binance: {e}[/red]")
+        return None
+
+
+def fetch_completed_candles(interval_code, limit, interval_label=None):
+    """
+    interval_code: Bybit's interval code (e.g. '1', '60', 'D')
+    interval_label: the human label (e.g. '1m', '1h') used by Binance's API.
+    """
+    if ACTIVE_SOURCE["name"] == "binance":
+        return _fetch_binance_candles(interval_label, limit)
+    if ACTIVE_SOURCE["name"] == "bybit":
+        candles = _fetch_bybit_candles(interval_code, limit)
+        if candles is not None:
+            return candles
+        console.print("[yellow]Bybit stopped responding, switching to Binance...[/yellow]")
+        ACTIVE_SOURCE["name"] = "binance"
+        return _fetch_binance_candles(interval_label, limit)
+
+    candles = _fetch_bybit_candles(interval_code, limit)
+    if candles is not None:
+        ACTIVE_SOURCE["name"] = "bybit"
+        return candles
+    console.print("[yellow]Bybit unreachable (likely region-blocked — Bybit blocks US/China IPs). "
+                  "Falling back to Binance...[/yellow]")
+    candles = _fetch_binance_candles(interval_label, limit)
+    if candles is not None:
+        ACTIVE_SOURCE["name"] = "binance"
+    return candles
+
+
+def create_current_candle(start_time, open_price, current_price):
+    return {
+        'start_time': start_time,
+        'open': open_price,
+        'high': current_price,
+        'low': current_price,
+        'close': current_price,
+        'volume': 0.0
+    }
+
+
+def update_candle(candle, price):
+    if price > candle['high']:
+        candle['high'] = price
+    if price < candle['low']:
+        candle['low'] = price
+    candle['close'] = price
+
+
+# ------------------------------------------------------------------
+# Engulfing pattern detection
+# ------------------------------------------------------------------
+def check_engulfing(prev, curr):
+    """
+    Compares two COMPLETED candles (prev -> curr) and returns:
+      'bullish'  -> bullish engulfing (curr fully engulfs prev body, prev bearish, curr bullish)
+      'bearish'  -> bearish engulfing (curr fully engulfs prev body, prev bullish, curr bearish)
+      None       -> no engulfing pattern
+    """
+    prev_open, prev_close = prev['open'], prev['close']
+    curr_open, curr_close = curr['open'], curr['close']
+
+    prev_bullish = prev_close > prev_open
+    curr_bullish = curr_close > curr_open
+
+    # bodies can't be zero-size (doji) for a meaningful engulfing signal
+    if prev_open == prev_close or curr_open == curr_close:
+        return None
+
+    prev_top, prev_bottom = max(prev_open, prev_close), min(prev_open, prev_close)
+    curr_top, curr_bottom = max(curr_open, curr_close), min(curr_open, curr_close)
+
+    # current candle's body must fully engulf the previous candle's body
+    engulfs = curr_top >= prev_top and curr_bottom <= prev_bottom
+    if not engulfs:
+        return None
+
+    if prev_bullish and not curr_bullish:
+        return "bearish"
+    if (not prev_bullish) and curr_bullish:
+        return "bullish"
+    return None
+
+
+def export_signal(symbol, interval_label, prev_candle, curr_candle, pattern, context_candles):
+    """
+    Saves the signal to a JSON log (append) and renders a PNG chart
+    highlighting the engulfing pair.
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    record = {
+        "timestamp_utc": timestamp,
+        "symbol": symbol,
+        "interval": interval_label,
+        "pattern": f"{pattern}_engulfing",
+        "prev_candle": {
+            "start_time": prev_candle['start_time'].isoformat(),
+            "open": prev_candle['open'],
+            "high": prev_candle['high'],
+            "low": prev_candle['low'],
+            "close": prev_candle['close'],
+        },
+        "curr_candle": {
+            "start_time": curr_candle['start_time'].isoformat(),
+            "open": curr_candle['open'],
+            "high": curr_candle['high'],
+            "low": curr_candle['low'],
+            "close": curr_candle['close'],
+        },
+    }
+
+    # --- append to JSON log ---
+    existing = []
+    if os.path.exists(JSON_LOG_PATH):
+        try:
+            with open(JSON_LOG_PATH, "r") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    existing.append(record)
+    with open(JSON_LOG_PATH, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    # --- render PNG ---
+    safe_ts = curr_candle['start_time'].strftime("%Y%m%d_%H%M%S")
+    png_path = os.path.join(OUTPUT_DIR, f"{pattern}_engulfing_{safe_ts}.png")
+    plot_engulfing_chart(context_candles, prev_candle, curr_candle, pattern, symbol, interval_label, png_path)
+
+    return record, png_path
+
+
+def plot_engulfing_chart(candles, prev_candle, curr_candle, pattern, symbol, interval_label, save_path):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    up_color = "#26a69a"
+    down_color = "#ef5350"
+    highlight_color = "#ffd54f"
+
+    for i, c in enumerate(candles):
+        is_bull = c['close'] >= c['open']
+        color = up_color if is_bull else down_color
+
+        is_highlighted = (c is prev_candle) or (c is curr_candle)
+
+        # wick
+        ax.plot([i, i], [c['low'], c['high']], color=color, linewidth=1)
+
+        body_bottom = min(c['open'], c['close'])
+        body_height = abs(c['close'] - c['open']) or (c['high'] - c['low']) * 0.02
+        rect = Rectangle(
+            (i - 0.3, body_bottom), 0.6, body_height,
+            facecolor=color,
+            edgecolor=highlight_color if is_highlighted else color,
+            linewidth=2.5 if is_highlighted else 0.5,
+            zorder=3
+        )
+        ax.add_patch(rect)
+
+    ax.set_xlim(-1, len(candles))
+    ax.set_title(f"{symbol} [{interval_label}] - {pattern.upper()} ENGULFING SIGNAL", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Price")
+    ax.set_xticks([])
+
+    arrow_color = "green" if pattern == "bullish" else "red"
+    idx_curr = candles.index(curr_candle)
+    ax.annotate(
+        f"{pattern.upper()} ENGULFING",
+        xy=(idx_curr, curr_candle['close']),
+        xytext=(idx_curr - 5, curr_candle['close'] + (curr_candle['high'] - curr_candle['low']) * 3),
+        arrowprops=dict(arrowstyle="->", color=arrow_color, lw=2),
+        fontsize=10, fontweight="bold", color=arrow_color
+    )
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+# ------------------------------------------------------------------
+# Terminal rendering — TradingView-style candlestick chart
+# ------------------------------------------------------------------
+# TradingView's default palette
+TV_UP = "#26a69a"     # teal/green candle
+TV_DOWN = "#ef5350"   # red candle
+TV_GRID = "#363a45"   # faint gridline
+TV_AXIS = "#787b86"   # muted axis text
+TV_PRICE_LINE = "#f0b90b"  # last-price dashed line (amber, like TV's price tag)
+
+# Fixed heights for the non-chart panels so the chart's ratio-based
+# region always gets an exact, predictable row count (no clipping).
+TABLE_PANEL_HEIGHT = 6
+SIGNAL_PANEL_HEIGHT = 5
+CHART_PANEL_CHROME = 4  # top border+title, subtitle+bottom border, axis tick row, axis label row
+
+
+def _nice_step(range_price, target_lines=6):
+    """
+    Picks a 'round' price increment (1, 2, 2.5, 5, 10, 20, 25, 50, 100...)
+    so axis labels land on clean numbers spaced evenly by price — exactly
+    how TradingView's right-hand axis works — instead of being evenly
+    spaced by row index (which produces ugly, unevenly-stepped decimals).
+    """
+    if range_price <= 0:
+        return 1.0
+    raw_step = range_price / target_lines
+    magnitude = 10 ** (len(str(int(raw_step))) - 1) if raw_step >= 1 else 10 ** -(len(f"{raw_step:.10f}".split('.')[1]) - len(f"{raw_step:.10f}".split('.')[1].lstrip('0')) + 1)
+    for mult in (1, 2, 2.5, 5, 10):
+        step = mult * magnitude
+        if step >= raw_step:
+            return step
+    return 10 * magnitude
+
+
+def _price_row_for(price, max_price, range_price, height):
+    """Which chart row (0=top) a given price falls on."""
+    row = (max_price - price) / range_price * height
+    return max(0, min(height - 1, int(row)))
+
+
+def render_candlestick_chart(candles, current_idx, height):
+    """
+    Renders a TradingView-style candlestick chart as a list of rich-markup
+    strings: colored candle bodies/wicks, a right-hand price axis with a
+    dotted gridline per label row, and a dashed line + tag at the last price.
+    """
+    if not candles:
+        return ["No data"], ""
+
+    height = max(6, height)  # never collapse to something unreadable
+
+    raw_min = min(c['low'] for c in candles)
+    raw_max = max(c['high'] for c in candles)
+    avg = (raw_min + raw_max) / 2.0
+    if avg and (raw_max - raw_min) / avg > 0.05:
+        half_range = avg * 0.025
+        min_price = avg - half_range
+        max_price = avg + half_range
+    else:
+        margin = (raw_max - raw_min) * 0.02 or 1
+        min_price = raw_min - margin
+        max_price = raw_max + margin
+
+    range_price = max_price - min_price
+    if range_price == 0:
+        range_price = 1
+
+    candle_data = []
+    for c in candles:
+        open_, close_ = c['open'], c['close']
+        candle_data.append({
+            'high': c['high'],
+            'low': c['low'],
+            'body_top': max(open_, close_),
+            'body_bottom': min(open_, close_),
+            'color': TV_UP if close_ >= open_ else TV_DOWN,
+        })
+
+    # --- TradingView-style axis: clean round numbers, evenly spaced by PRICE ---
+    step = _nice_step(range_price, target_lines=6)
+    first_tick = (min_price // step + 1) * step
+    grid_prices = []
+    p = first_tick
+    while p <= max_price:
+        grid_prices.append(round(p, 8))
+        p += step
+
+    label_rows = {}
+    for gp in grid_prices:
+        row = _price_row_for(gp, max_price, range_price, height)
+        label_rows[row] = gp  # row -> exact round price to display
+
+    last_price = candles[current_idx]['close']
+    price_row = _price_row_for(last_price, max_price, range_price, height)
+
+    rows_chars = []
+    for row in range(height):
+        price_level = max_price - row * (range_price / height)
+        row_chars = []
+        for cd in candle_data:
+            if cd['low'] <= price_level <= cd['high']:
+                if cd['body_bottom'] <= price_level <= cd['body_top']:
+                    row_chars.append(("█", cd['color']))
+                else:
+                    row_chars.append(("│", cd['color']))
+            else:
+                # background: gridline dot on label rows / the price-line row, else blank
+                if row == price_row:
+                    row_chars.append(("╌", TV_PRICE_LINE))
+                elif row in label_rows:
+                    row_chars.append(("·", TV_GRID))
+                else:
+                    row_chars.append((" ", None))
+        rows_chars.append(row_chars)
+
+    max_label_len = max(len(f"{max_price:,.2f}"), len(f"{min_price:,.2f}")) + 1
+
+    chart_lines = []
+    for idx, row_chars in enumerate(rows_chars):
+        parts = []
+        for ch, color in row_chars:
+            if color is None:
+                parts.append(" ")
+            else:
+                parts.append(f"[{color}]{ch}[/{color}]")
+        line = " ".join(parts)
+
+        if idx == price_row:
+            label = f"{last_price:,.2f}"
+            tag = f"[black on {TV_PRICE_LINE}] {label:>{max_label_len}} [/black on {TV_PRICE_LINE}]"
+            line = f"{line} {tag}"
+        elif idx in label_rows:
+            label = f"{label_rows[idx]:,.2f}"
+            line = f"{line}  [{TV_AXIS}]{label:>{max_label_len}}[/{TV_AXIS}]"
+        else:
+            line = f"{line}  {' ' * max_label_len}"
+        chart_lines.append(line)
+
+    # --- x-axis: tick marks + time labels under a handful of candles ---
+    total_width = len(candles) * 2 - 1
+    tick_row = [" "] * total_width
+    label_row = [" "] * total_width
+    step = max(1, len(candles) // 6)
+    tick_positions = sorted(set(list(range(0, len(candles), step)) + [len(candles) - 1]))
+    for i in tick_positions:
+        pos = i * 2
+        tick_row[pos] = "╵"
+        label = candles[i]['start_time'].astimezone().strftime("%H:%M")
+        start = pos - len(label) // 2
+        start = max(0, min(total_width - len(label), start))
+        for j, ch in enumerate(label):
+            k = start + j
+            if 0 <= k < total_width:
+                label_row[k] = ch
+    tick_line = f"[{TV_AXIS}]{''.join(tick_row)}[/{TV_AXIS}]"
+    time_line = f"[{TV_AXIS}]{''.join(label_row)}[/{TV_AXIS}]"
+
+    return chart_lines, tick_line, time_line
+
+
+def build_layout(candles, current_idx, interval_sec, last_signal_text, console_height=40):
+    now = datetime.now(timezone.utc)
+    current_candle = candles[current_idx]
+    elapsed = (now - current_candle['start_time']).total_seconds()
+    total = interval_sec
+    remaining = max(0, total - elapsed)
+    percent = min(100, (elapsed / total) * 100) if total > 0 else 0
+    bar_len = 20
+    filled = int(bar_len * percent / 100)
+    bar = '█' * filled + '░' * (bar_len - filled)
+    header_text = f"BTC/USDT · {interval_sec // 60}m · {len(candles)} candles"
+    countdown_text = f"Next candle in {int(remaining)}s [{bar}] {percent:.0f}%"
+
+    # Chart panel gets whatever rows are left after the fixed-size panels below it.
+    chart_height = console_height - TABLE_PANEL_HEIGHT - SIGNAL_PANEL_HEIGHT - CHART_PANEL_CHROME
+    chart_lines, tick_line, time_line = render_candlestick_chart(candles, current_idx, chart_height)
+
+    chart_body = "\n".join(chart_lines) + "\n" + tick_line + "\n" + time_line
+    chart_panel = Panel(
+        chart_body,
+        title=f"[bold]{header_text}[/bold]",
+        subtitle=countdown_text,
+        border_style=TV_GRID,
+        box=box.SQUARE,
+        padding=(0, 1),
+    )
+
+    c = candles[current_idx]
+    color = TV_UP if c['close'] >= c['open'] else TV_DOWN
+    table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style=f"bold {TV_AXIS}", padding=(0, 1))
+    table.add_column("", style="dim", width=3)
+    table.add_column("Open", justify="right")
+    table.add_column("High", justify="right")
+    table.add_column("Low", justify="right")
+    table.add_column("Close", justify="right")
+    table.add_column("Volume", justify="right")
+    table.add_row(
+        ">>",
+        f"[{color}]{c['open']:,.2f}[/{color}]",
+        f"[{color}]{c['high']:,.2f}[/{color}]",
+        f"[{color}]{c['low']:,.2f}[/{color}]",
+        f"[{color}]{c['close']:,.2f}[/{color}]",
+        f"{c['volume']:,.2f}"
+    )
+
+    signal_panel = Panel(
+        last_signal_text or "No engulfing signal yet.",
+        title="Last Signal",
+        border_style=TV_PRICE_LINE if last_signal_text else TV_GRID,
+        box=box.SQUARE,
+    )
+
+    layout = Layout()
+    layout.split(
+        Layout(chart_panel, ratio=1),
+        Layout(table, size=TABLE_PANEL_HEIGHT),
+        Layout(signal_panel, size=SIGNAL_PANEL_HEIGHT),
+    )
+    return layout
+
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
+def main():
+    console.print("[bold green]Live OHLC + Engulfing Signal Finder for BTC/USDT (Bybit)[/bold green]")
+    interval_input = input("Enter timeframe (e.g., 1m, 5m, 1h) [default: 1m]: ").strip() or '1m'
+    if interval_input not in INTERVAL_MAP:
+        console.print(f"[red]Unsupported. Using 1m. Supported: {', '.join(INTERVAL_MAP.keys())}[/red]")
+        interval_input = '1m'
+
+    interval_api = INTERVAL_MAP[interval_input]
+    interval_sec = INTERVAL_SECONDS[interval_input]
+    symbol = "BTCUSDT"
+
+    completed = None
+    for attempt in range(3):
+        console.print(f"Fetching initial data... attempt {attempt + 1}/3")
+        completed = fetch_completed_candles(interval_api, KEEP_COUNT, interval_input)
+        if completed is not None:
+            break
+        time.sleep(2)
+    if completed is None:
+        console.print("[red]Failed to fetch initial data after multiple attempts. Exiting.[/red]")
+        return
+
+    current_price = None
+    for attempt in range(3):
+        current_price = get_current_price()
+        if current_price is not None:
+            break
+        time.sleep(2)
+    if current_price is None:
+        console.print("[red]Failed to fetch current price. Exiting.[/red]")
+        return
+
+    last = completed[-1]
+    last_end = last['start_time'] + timedelta(seconds=interval_sec)
+    now = datetime.now(timezone.utc)
+
+    if now < last_end:
+        candles = completed[:]
+        current_idx = len(candles) - 1
+        update_candle(candles[current_idx], current_price)
+    else:
+        candles = completed[:]
+        new_start = last_end
+        new_open = last['close']
+        new_candle = create_current_candle(new_start, new_open, current_price)
+        candles.append(new_candle)
+        if len(candles) > KEEP_COUNT:
+            candles = candles[-KEEP_COUNT:]
+        current_idx = len(candles) - 1
+
+    # Check the two most recently COMPLETED candles at startup (informational)
+    last_signal_text = None
+    if len(completed) >= 2:
+        pattern = check_engulfing(completed[-2], completed[-1])
+        if pattern:
+            record, png_path = export_signal(symbol, interval_input, completed[-2], completed[-1], pattern, completed)
+            last_signal_text = f"[{pattern.upper()}] {record['timestamp_utc']} -> {png_path}"
+            console.print(f"[bold yellow]Startup {pattern} engulfing signal found -> {png_path}[/bold yellow]")
+
+    console.print(f"Monitoring started (interval: {interval_input}, keeping {KEEP_COUNT} candles). Press Ctrl+C to stop.")
+
+    with Live(refresh_per_second=0.5, screen=True) as live:
+        try:
+            while True:
+                console_height = live.console.size.height
+                new_price = get_current_price()
+                if new_price is None:
+                    time.sleep(2)
+                    continue
+
+                update_candle(candles[current_idx], new_price)
+
+                now = datetime.now(timezone.utc)
+                current_start = candles[current_idx]['start_time']
+                next_start = current_start + timedelta(seconds=interval_sec)
+
+                if now >= next_start:
+                    # The candle at current_idx has just COMPLETED.
+                    # Check it against the candle before it for an engulfing pattern.
+                    if current_idx - 1 >= 0:
+                        prev_candle = candles[current_idx - 1]
+                        curr_candle = candles[current_idx]
+                        pattern = check_engulfing(prev_candle, curr_candle)
+                        if pattern:
+                            record, png_path = export_signal(
+                                symbol, interval_input, prev_candle, curr_candle, pattern, candles
+                            )
+                            last_signal_text = f"[{pattern.upper()}] {record['timestamp_utc']} -> {png_path}"
+                            console.print(
+                                f"[bold yellow]{pattern.upper()} ENGULFING signal detected! "
+                                f"Saved chart to {png_path} and logged to {JSON_LOG_PATH}[/bold yellow]"
+                            )
+
+                    new_open = candles[current_idx]['close']
+                    new_candle = create_current_candle(next_start, new_open, new_price)
+                    candles.append(new_candle)
+                    if len(candles) > KEEP_COUNT:
+                        candles = candles[1:]
+                    current_idx = len(candles) - 1
+
+                layout = build_layout(candles, current_idx, interval_sec, last_signal_text, console_height)
+                live.update(layout)
+                time.sleep(2)
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Monitoring stopped.[/bold yellow]")
+
+
+if __name__ == "__main__":
+    main()
